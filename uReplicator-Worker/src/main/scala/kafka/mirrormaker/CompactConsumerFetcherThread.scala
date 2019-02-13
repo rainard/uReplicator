@@ -18,26 +18,32 @@ package kafka.mirrormaker
 import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
 
+import com.google.common.collect.ImmutableMap
+import com.uber.kafka.consumer.NewSimpleConsumerConfig
+import com.uber.kafka.scalaapi.consumer.{FetchResponse, NewSimpleConsumer}
 import kafka.api._
 import kafka.cluster.BrokerEndPoint
-import kafka.common.{ClientIdAndBroker, ErrorMapping, KafkaException, TopicAndPartition}
-import kafka.consumer.{ConsumerConfig, SimpleConsumer}
-import kafka.message.{ByteBufferMessageSet, InvalidMessageException, MessageAndOffset}
+import kafka.common._
+import kafka.consumer.ConsumerConfig
+import kafka.message._
 import kafka.server.{ClientIdTopicPartition, FetcherLagStats, FetcherStats, PartitionFetchState}
 import kafka.utils.CoreUtils._
 import kafka.utils.ShutdownableThread
+import org.apache.kafka.clients.CommonClientConfigs
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.requests.FetchRequest
 
 import scala.collection.{Map, Set, mutable}
 
 /**
- * Fetcher thread that fetches data for multiple topic partitions from the same broker.
- *
- * @param name
- * @param config
- * @param sourceBroker
- * @param partitionInfoMap
- * @param consumerFetcherManager
- */
+  * Fetcher thread that fetches data for multiple topic partitions from the same broker.
+  *
+  * @param name
+  * @param config
+  * @param sourceBroker
+  * @param partitionInfoMap
+  * @param consumerFetcherManager
+  */
 class CompactConsumerFetcherThread(name: String,
                                    val config: ConsumerConfig,
                                    sourceBroker: BrokerEndPoint,
@@ -64,15 +70,19 @@ class CompactConsumerFetcherThread(name: String,
   private val partitionMapLock = new ReentrantLock
   private val partitionMapCond = partitionMapLock.newCondition()
 
-  val simpleConsumer = new SimpleConsumer(sourceBroker.host, sourceBroker.port, socketTimeout, socketBufferSize, clientId)
+  val consumerProperties : java.util.Map[String, Object] = ImmutableMap.of(
+    CommonClientConfigs.CLIENT_ID_CONFIG, clientId,
+    NewSimpleConsumerConfig.CLIENT_SOCKET_RECEIVE_BUFFER_CONFIG, socketBufferSize.toString,
+    NewSimpleConsumerConfig.CLIENT_CONNECTION_TIMEOUT_CONFIG, socketTimeout.toString
+  )
+  val newSimpleConsumerConfig = new NewSimpleConsumerConfig(consumerProperties)
+
+  val simpleConsumer = new NewSimpleConsumer(sourceBroker.host, sourceBroker.port, newSimpleConsumerConfig)
+  simpleConsumer.connect()
+
   private val metricId = new ClientIdAndBroker(clientId, sourceBroker.host, sourceBroker.port)
   val fetcherStats = new FetcherStats(metricId)
   val fetcherLagStats = new FetcherLagStats(metricId)
-  val fetchRequestBuilder = new FetchRequestBuilder().
-    clientId(clientId).
-    replicaId(fetcherBrokerId).
-    maxWait(maxWait).
-    minBytes(minBytes)
 
   var newMsgSize = 0
 
@@ -165,8 +175,8 @@ class CompactConsumerFetcherThread(name: String,
 
   override def doWork() {
     try {
-      var fetchRequest: FetchRequest = null
-
+      var fetchRequestBuilder :FetchRequest.Builder = null
+      val fetchData = new java.util.HashMap[TopicPartition, FetchRequest.PartitionData]()
       inLock(partitionMapLock) {
         inLock(updateMapLock) {
           // add topic partition into partitionMap
@@ -199,21 +209,23 @@ class CompactConsumerFetcherThread(name: String,
         partitionMap.foreach {
           case ((topicAndPartition, partitionFetchState)) =>
             if (partitionFetchState.isReadyForFetch) {
-              fetchRequestBuilder.addFetch(topicAndPartition.topic, topicAndPartition.partition,
-                partitionFetchState.fetchOffset, fetchSize)
+              fetchData.put(
+                new TopicPartition(topicAndPartition.topic, topicAndPartition.partition),
+                new FetchRequest.PartitionData(partitionFetchState.fetchOffset, 0, fetchSize)
+              )
             }
         }
+        fetchRequestBuilder = FetchRequest.Builder.forConsumer(maxWait, minBytes, fetchData)
 
-        fetchRequest = fetchRequestBuilder.build()
-        if (fetchRequest.requestInfo.isEmpty) {
+        if (fetchData.isEmpty) {
           trace("There are no active partitions. Back off for %d ms before sending a fetch request".format(fetchBackOffMs))
           partitionMapCond.await(fetchBackOffMs, TimeUnit.MILLISECONDS)
         }
         logTopicPartitionInfo()
       }
 
-      if (!fetchRequest.requestInfo.isEmpty) {
-        processFetchRequest(fetchRequest)
+      if (!fetchData.isEmpty) {
+        processFetchRequest(fetchRequestBuilder)
       }
     } catch {
       case e: InterruptedException =>
@@ -226,7 +238,7 @@ class CompactConsumerFetcherThread(name: String,
             isOOM = true
             if (consumerFetcherManager.systemExisting.compareAndSet(false, true)) {
               error("First OOM or processing error, call System.exit(-1);")
-              System.exit(-1);
+              System.exit(-1)
             }
             throw e
           }
@@ -234,16 +246,16 @@ class CompactConsumerFetcherThread(name: String,
     }
   }
 
-  private def processFetchRequest(fetchRequest: FetchRequest) {
+  private def processFetchRequest(fetchRequestBuilder: FetchRequest.Builder) {
     val partitionsWithError = new mutable.HashSet[TopicAndPartition]
     var response: FetchResponse = null
     try {
-      trace("Issuing to broker %d of fetch request %s".format(sourceBroker.id, fetchRequest))
-      response = simpleConsumer.fetch(fetchRequest)
+      trace("Issuing to broker %d of fetch request builder %s".format(sourceBroker.id, fetchRequestBuilder))
+      response = simpleConsumer.fetch(fetchRequestBuilder)
     } catch {
       case t: Throwable =>
         if (isRunning) {
-          warn("Error in fetch %s. Possible cause: %s".format(fetchRequest, t.toString))
+          warn("Error in fetch %s. Possible cause: %s".format(fetchRequestBuilder, t.toString))
           if (t.toString.contains(OUT_OF_MEMORY_ERROR)) {
             throw t
           }
@@ -260,15 +272,16 @@ class CompactConsumerFetcherThread(name: String,
     if (response != null) {
       // process fetched data
       inLock(partitionMapLock) {
-        response.data.foreach {
+        response.data().foreach {
           case (topicAndPartition, partitionData) =>
             val topic = topicAndPartition.topic
-            val partitionId =topicAndPartition.partition
-          partitionMap.get(topicAndPartition).foreach(currentPartitionFetchState => {
+            val partitionId = topicAndPartition.partition
+            partitionMap.get(topicAndPartition).foreach(currentPartitionFetchState => {
               // we append to the log if the current offset is defined and it is the same as the offset requested during fetch
-              val requestOffset = fetchRequest.requestInfo.toMap.get(topicAndPartition) match {
-                case Some(info) => info.offset
-                case _ => -1
+              var requestOffset = -1L
+              val requestPartitionData = fetchRequestBuilder.fetchData.get(new TopicPartition(topic, partitionId))
+              if (requestPartitionData != null) {
+                requestOffset = requestPartitionData.fetchOffset
               }
               if (requestOffset == currentPartitionFetchState.fetchOffset) {
                 partitionData.error.code() match {
@@ -276,18 +289,10 @@ class CompactConsumerFetcherThread(name: String,
                     try {
                       val messages = partitionData.messages.asInstanceOf[ByteBufferMessageSet]
                       val validBytes = messages.validBytes
-                      var count = 0
-                      var string1 = ""
-                      messages.shallowIterator.toSeq.foreach {
-                        case s =>
-                          count = count + 1
-                          string1 += " " + s.nextOffset.toString
-                      }
                       val newOffset = messages.shallowIterator.toSeq.lastOption match {
                         case Some(m: MessageAndOffset) => m.nextOffset
                         case None => currentPartitionFetchState.fetchOffset
                       }
-                      info(s"temp4 $string1 $newOffset")
                       partitionMap.put(topicAndPartition, new PartitionFetchState(newOffset))
                       fetcherLagStats.getAndMaybePut(topic, partitionId).lag = partitionData.hw - newOffset
                       fetcherStats.byteRate.mark(validBytes)
